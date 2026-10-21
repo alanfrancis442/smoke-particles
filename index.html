@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500&display=swap" rel="stylesheet" />
+    <title>igloo-particles</title>
+  </head>
+  <body>
+    <canvas id="canvas"></canvas>
+
+    <div class="hint">/// MOVE THE CURSOR · CLICK OR USE ARROW KEYS TO SWITCH</div>
+    <button class="arrow" id="arrow-prev" aria-label="Previous shape"></button>
+    <button class="arrow" id="arrow-next" aria-label="Next shape"></button>
+    <div class="carousel">
+      <span class="side" id="label-prev"></span>
+      <span class="bracket"><span id="label-current"></span></span>
+      <span class="side" id="label-next"></span>
+    </div>
+
+    <div class="no-webgpu-message">This demo needs WebGPU (Chrome, Edge, Safari 26+ or Firefox 141+).</div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
