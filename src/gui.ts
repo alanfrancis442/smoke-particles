@@ -33,11 +33,14 @@ export function setupInspector(renderer: THREE.WebGPURenderer, t: Tweakables) {
     set shape(v: number) { t.onShapeChange(Number(v)) },
     get volumeScale() { return t.particles.volumeScale },
     set volumeScale(v: number) { t.particles.volumeScale = v },
+    get flow() { return t.particles.flow },
+    set flow(v: number) { t.particles.flow = v },
   }
   const shapeOptions = Object.fromEntries(t.particles.shapeNames.map((name, i) => [name, i]))
   shape.add(shapeState, 'shape', shapeOptions)
   shape.add(shapeState, 'volumeScale', 0.8, 1.6, 0.01).name('scale (smaller = bigger)')
   shape.add(k, 'rotationSpeed', -2, 2, 0.01).name('rotation speed')
+  shape.add(shapeState, 'flow', 0, 1, 0.01).name('flow (0 = rigid spin)')
 
   // --- particle look
   const look = inspector.createParameters('Particle look')

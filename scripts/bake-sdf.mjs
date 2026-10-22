@@ -1,17 +1,19 @@
-// Bakes the particle target shapes into 64³ signed-distance volumes.
+// Bakes the particle target shapes into 128³ signed-distance volumes.
 //
-// Output per shape: public/volumes/<name>.bin, RES³ RGBA8 texels laid out x-fastest,
+// Output per shape: public/volumes/<name>.vol: gzipped RES³ RGBA8 texels laid out x-fastest,
 //   rgb = SDF gradient (outward surface normal) * 0.5 + 0.5
-//   a   = signed distance in volume units (the [0,1] cube), clamped to ±1, * 0.5 + 0.5
+//   a   = signed distance d in volume units (the [0,1] cube), stored as sign(d)·sqrt(|d|) * 0.5 + 0.5
+//         so 8 bits resolve a fraction of a voxel near the surface (decode: e·|e|)
 //
 // Run with: node scripts/bake-sdf.mjs
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { gzipSync } from 'node:zlib'
 import * as THREE from 'three'
 import { mergeGeometries, mergeVertices } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import { MeshBVH } from 'three-mesh-bvh'
 
-const RES = 64
+const RES = 128
 const FILL = 0.9 // largest dimension of the shape, as a fraction of the volume
 const OUT_DIR = new URL('../public/volumes/', import.meta.url)
 
@@ -111,9 +113,11 @@ function mediumLogo() {
 // ---------------------------------------------------------------------------
 // SDF bake
 
-function bake(name, geometry) {
+function bake(name, geometry, { rotateX = 0, solid = false, thicken = 0 } = {}) {
   for (const key of Object.keys(geometry.attributes)) if (key !== 'position') geometry.deleteAttribute(key)
   geometry = mergeVertices(geometry)
+  // stand flat models up: the cloud spins around Y, so a model lying in XZ would only show its edge
+  if (rotateX) geometry.rotateX(THREE.MathUtils.degToRad(rotateX))
 
   // centre and fit into the [-0.5, 0.5] volume
   geometry.computeBoundingBox()
@@ -123,7 +127,7 @@ function bake(name, geometry) {
   geometry.translate(-center.x, -center.y, -center.z)
   geometry.scale(...Array(3).fill(FILL / Math.max(size.x, size.y, size.z)))
 
-  const bvh = new MeshBVH(geometry)
+  const bvh = new MeshBVH(geometry, { maxDepth: 64 })
   const dist = new Float32Array(RES ** 3)
   const p = new THREE.Vector3()
   const hit = {}
@@ -145,6 +149,40 @@ function bake(name, geometry) {
         dist[x + y * RES + z * RES * RES] = inside >= 2 ? -hit.distance : hit.distance
       }
 
+  // Ray parity breaks on overlapping or open shells, leaving holes inside. Flood-fill the outside
+  // from the volume border through voxels further than half a voxel from the surface – a step
+  // between neighbours can't cross a wall without one end being that close. Unreached far voxels
+  // are inside; near-surface voxels keep their parity sign.
+  // `solid` floods each horizontal slice on its own and makes everything unreached inside, so an
+  // open-topped thin shell (the cup) becomes a filled body.
+  const band = 0.5 / RES
+  const outside = new Uint8Array(RES ** 3)
+  const stack = []
+  const visit = (x, y, z) => {
+    if (x < 0 || y < 0 || z < 0 || x >= RES || y >= RES || z >= RES) return
+    const i = x + y * RES + z * RES * RES
+    if (outside[i] || Math.abs(dist[i]) <= band) return
+    outside[i] = 1
+    stack.push(x, y, z)
+  }
+  for (let a = 0; a < RES; a++)
+    for (let b = 0; b < RES; b++)
+      for (const e of [0, RES - 1]) { visit(e, a, b); if (!solid) visit(a, e, b); visit(a, b, e) }
+  while (stack.length) {
+    const z = stack.pop(), y = stack.pop(), x = stack.pop()
+    visit(x + 1, y, z); visit(x - 1, y, z); visit(x, y, z + 1); visit(x, y, z - 1)
+    if (!solid) { visit(x, y + 1, z); visit(x, y - 1, z) }
+  }
+  for (let i = 0; i < dist.length; i++)
+    if (solid || Math.abs(dist[i]) > band) dist[i] = outside[i] ? Math.abs(dist[i]) : -Math.abs(dist[i])
+
+  // `thicken` (in voxels) grows every part by that much, so sheets and struts thinner than a voxel
+  // (propeller blades, a mesh headband) still get an inside for the particles to settle on.
+  // Near-surface voxels use the unsigned distance: their sign is unreliable on such parts anyway.
+  if (thicken)
+    for (let i = 0; i < dist.length; i++)
+      dist[i] = (Math.abs(dist[i]) <= band ? Math.abs(dist[i]) : dist[i]) - thicken / RES
+
   const at = (x, y, z) => {
     x = Math.min(RES - 1, Math.max(0, x)); y = Math.min(RES - 1, Math.max(0, y)); z = Math.min(RES - 1, Math.max(0, z))
     return dist[x + y * RES + z * RES * RES]
@@ -152,6 +190,7 @@ function bake(name, geometry) {
   const out = new Uint8Array(RES ** 3 * 4)
   const g = new THREE.Vector3()
   const enc = (v) => Math.round(Math.min(1, Math.max(-1, v)) * 127.5 + 127.5)
+  const encDist = (d) => enc(Math.sign(d) * Math.sqrt(Math.abs(d)))
   for (let z = 0; z < RES; z++)
     for (let y = 0; y < RES; y++)
       for (let x = 0; x < RES; x++) {
@@ -160,15 +199,29 @@ function bake(name, geometry) {
         g.normalize()
         const i = (x + y * RES + z * RES * RES) * 4
         out[i] = enc(g.x); out[i + 1] = enc(g.y); out[i + 2] = enc(g.z)
-        out[i + 3] = enc(dist[i / 4])
+        out[i + 3] = encDist(dist[i / 4])
       }
 
-  writeFileSync(new URL(`${name}.bin`, OUT_DIR), out)
+  // not .gz: dev servers would send that with Content-Encoding and the browser would unzip it early
+  writeFileSync(new URL(`${name}.vol`, OUT_DIR), gzipSync(out, { level: 9 }))
   const insideCount = dist.reduce((n, d) => n + (d < 0), 0)
   console.log(`${name}: ${((performance.now() - t0) / 1000).toFixed(1)}s, ${(100 * insideCount / dist.length).toFixed(1)}% inside`)
 }
 
+const glb = (file, options) => () => [loadGLB(new URL(`../assets-src/${file}`, import.meta.url)), options]
+const SHAPES = {
+  duck: glb('Duck.glb'),
+  x: () => [xLogo()],
+  medium: () => [mediumLogo()],
+  drone: glb('Drone.glb', { rotateX: 60, thicken: 0.75 }),
+  'f1-wheel': glb('F1Wheel.glb', { rotateX: 90, thicken: 0.5 }),
+  'airpods-max': glb('AirPodsMax.glb', { thicken: 0.75 }),
+  'takeaway-cup': glb('TakeAwayCup.glb', { solid: true }),
+  'steam-deck': glb('SteamDeck.glb', { rotateX: 90, thicken: 0.5 }),
+  vr: glb('VR.glb', { thicken: 0.75 }),
+}
+
+// node scripts/bake-sdf.mjs [name ...] bakes only the named shapes
+const only = process.argv.slice(2)
 mkdirSync(OUT_DIR, { recursive: true })
-bake('duck', loadGLB(new URL('../assets-src/Duck.glb', import.meta.url)))
-bake('x', xLogo())
-bake('medium', mediumLogo())
+for (const [name, build] of Object.entries(SHAPES)) if (!only.length || only.includes(name)) bake(name, ...build())

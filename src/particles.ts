@@ -16,17 +16,23 @@ import type { FluidSim } from './fluid'
 // The SDF is sampled through a slowly spinning rotation, so the cloud keeps
 // flowing around the shape instead of settling. Velocities are per-frame at
 // 60fps and scaled by dtRatio, exactly like the original.
+// Particles can only chase the spinning surface so fast: thin, far-out parts
+// (wheel grips, propellers, a headband) sweep away from them and smear. So each
+// shape has a `flow` fraction – that much of the spin goes through the SDF, the
+// rest rotates the whole particle object rigidly. 1 = the original look.
 
 // TSL's generic node typings are too strict for small graph helpers
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyNode = any
 
-export const VOLUME_RES = 64
+export const VOLUME_RES = 128
 
 export interface ParticleShape {
   name: string
   volume: Uint8Array // VOLUME_RES³ RGBA8, see scripts/bake-sdf.mjs
   scale: number
+  flow: number // fraction of the spin that flows through the SDF, the rest is rigid
+  facing?: number // world Y angle the shape faces on switch, default π/2 like the original
 }
 
 const CUBE_SIZE = 0.65
@@ -85,6 +91,7 @@ export class VolumeParticles {
     time: uniform(0),
     dtRatio: uniform(1),
     rotation: uniform(0),
+    spin: uniform(0), // rigid object rotation (Y), mirrors object.rotation.y
     shapeIndex: uniform(0),
     volumeScale: uniform(1),
     additionalNoise: uniform(0),
@@ -155,14 +162,19 @@ export class VolumeParticles {
       const vol = texture3D(volumeTexture, samplePos).level(float(0))
       const g = normalize(vol.rgb.mul(2).sub(1))
       const grad = vec3(c.mul(g.x).sub(s.mul(g.z)), g.y, s.mul(g.x).add(c.mul(g.z))).toVar() // inverse rotation
-      const dist = vol.a.mul(2).sub(1).sub(k.shellOffset)
+      const e = vol.a.mul(2).sub(1)
+      const dist = e.mul(e.abs()).sub(k.shellOffset) // stored as sign(d)·sqrt(|d|)
 
       // fluid interaction: screen-space velocity under the particle
       const world = u.modelMatrix.mul(vec4(pos.xyz, 1))
       const clip = u.projMatrix.mul(u.viewMatrix.mul(world))
       const screenUV = clip.xy.div(clip.w).add(1).mul(0.5)
       const fluidVel = fluid.sample(screenUV)
-      const push = u.camRight.mul(fluidVel.x).add(u.camUp.mul(fluidVel.y))
+      // world → particle space (undo the rigid spin)
+      const cs: AnyNode = cos(u.spin)
+      const ss: AnyNode = sin(u.spin)
+      const toLocal = (v: AnyNode) => vec3(cs.mul(v.x).sub(ss.mul(v.z)), v.y, ss.mul(v.x).add(cs.mul(v.z)))
+      const push = toLocal(u.camRight.mul(fluidVel.x).add(u.camUp.mul(fluidVel.y)))
       vel.xyz.addAssign(push.mul(k.fluidPush).mul(dt).mul(k.interactForce))
       const invFluid = float(1).sub(length(fluidVel).mul(k.fluidRelax).mul(k.interactForce))
 
@@ -191,7 +203,7 @@ export class VolumeParticles {
       pos.xz.mulAssign(min(r, 0.275).div(max(r, 1e-6)))
 
       // wrapped diffuse from the SDF normal (GPU Gems ch.16), dark when deep inside
-      const dp = dot(normalize(k.lightDir), grad)
+      const dp = dot(toLocal(normalize(k.lightDir)), grad)
       const diffuse = max(0, dp.add(k.wrap).div(k.wrap.add(1))).add(max(0, dp.negate()).mul(0.1))
       const targetShadow = mix(diffuse.mul(k.insideShadow), diffuse, smoothstep(-0.05, -0.001, dist))
       pos.w.assign(mix(targetShadow, pos.w, u.additionalNoise))
@@ -243,7 +255,7 @@ export class VolumeParticles {
     u.dtRatio.value = 1
     for (let i = 0; i < steps; i++) {
       u.time.value = i / 60
-      u.rotation.value -= this.settings.rotationSpeed / 60
+      this.spin(1 / 60)
       renderer.compute(this.simulate)
     }
   }
@@ -265,13 +277,31 @@ export class VolumeParticles {
     this.uniforms.volumeScale.value = value
   }
 
+  get flow() {
+    return this.shapes[this.current].flow
+  }
+
+  set flow(value: number) {
+    this.shapes[this.current].flow = value
+  }
+
   /** Jump to a shape, with the noise burst used by the original. */
   setShape(index: number, time: number) {
     const n = this.shapes.length
     this.current = ((index % n) + n) % n
     this.applyShape(this.current)
+    // the shape's world angle is spin - rotation
     this.uniforms.rotation.value = Math.PI * 1.5
+    this.object.rotation.y = (this.shapes[this.current].facing ?? Math.PI / 2) + Math.PI * 1.5
     this.noiseTween = { from: 1, start: time, duration: 0.5 }
+  }
+
+  private spin(delta: number) {
+    const angle = delta * this.settings.rotationSpeed
+    const flow = this.shapes[this.current].flow
+    this.uniforms.rotation.value -= angle * flow
+    this.object.rotation.y += angle * (1 - flow)
+    this.uniforms.spin.value = this.object.rotation.y
   }
 
   private applyShape(index: number) {
@@ -283,7 +313,7 @@ export class VolumeParticles {
     const u = this.uniforms
     u.time.value = time
     u.dtRatio.value = dtRatio
-    u.rotation.value -= delta * this.settings.rotationSpeed
+    this.spin(delta)
 
     // power2.inOut from 1 → 0
     const t = this.noiseTween.start < 0 ? 1 : Math.min(1, (time - this.noiseTween.start) / this.noiseTween.duration)

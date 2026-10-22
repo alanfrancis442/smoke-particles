@@ -19,10 +19,19 @@ if (!navigator.gpu) {
   throw new Error('WebGPU is not available in this browser')
 }
 
+// flow: how much of the spin flows through the SDF instead of turning the cloud rigidly.
+// Detailed models with thin parts smear at the original 1, so they mostly spin rigidly
+// and face the camera (facing 0) when switched to.
 const SHAPES = [
-  { name: 'Duck', file: 'duck', scale: 1.15 },
-  { name: 'X / Twitter', file: 'x', scale: 1.2 },
-  { name: 'Medium', file: 'medium', scale: 1.05 },
+  { name: 'Duck', file: 'duck', scale: 1.15, flow: 1 },
+  { name: 'X / Twitter', file: 'x', scale: 1.2, flow: 1 },
+  { name: 'Medium', file: 'medium', scale: 1.05, flow: 1 },
+  { name: 'Drone', file: 'drone', scale: 1.2, flow: 0.1, facing: 0 },
+  { name: 'F1 Wheel', file: 'f1-wheel', scale: 1.2, flow: 0.15, facing: 0 },
+  { name: 'AirPods Max', file: 'airpods-max', scale: 1.15, flow: 0.15, facing: 0 },
+  { name: 'Takeaway Cup', file: 'takeaway-cup', scale: 1.15, flow: 0.4, facing: 0 },
+  { name: 'Steam Deck', file: 'steam-deck', scale: 1.2, flow: 0.15, facing: 0 },
+  { name: 'VR Headset', file: 'vr', scale: 1.2, flow: 0.1, facing: 0 },
 ]
 
 const params = new URLSearchParams(location.search)
@@ -41,9 +50,12 @@ const lookTarget = new THREE.Vector3(0, -0.03, 0)
 const environment = createEnvironment(scene)
 
 const volumes = await Promise.all(
-  SHAPES.map(async (s) => new Uint8Array(await (await fetch(`/volumes/${s.file}.bin`)).arrayBuffer())),
+  SHAPES.map(async (s) => {
+    const response = await fetch(`/volumes/${s.file}.vol`)
+    return new Uint8Array(await new Response(response.body!.pipeThrough(new DecompressionStream('gzip'))).arrayBuffer())
+  }),
 )
-const shapes: ParticleShape[] = SHAPES.map((s, i) => ({ name: s.name, scale: s.scale, volume: volumes[i] }))
+const shapes: ParticleShape[] = SHAPES.map(({ file: _, ...s }, i) => ({ ...s, volume: volumes[i] }))
 
 const fluid = new FluidSim()
 const particles = new VolumeParticles(shapes, fluid, particleCount)
